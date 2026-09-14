@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "lha7668.h"
 #include "function.h"
+#include "can.h"
 
 /* USER CODE END Includes */
 
@@ -235,8 +236,27 @@ void USB_LP_CAN1_RX0_IRQHandler(void)
   /* USER CODE END USB_LP_CAN1_RX0_IRQn 0 */
   HAL_CAN_IRQHandler(&hcan);
   /* USER CODE BEGIN USB_LP_CAN1_RX0_IRQn 1 */
+    uint8_t i = 0, all_zero = 1;
+
     HAL_CAN_GetRxMessage(&hcan, CAN_RX_FIFO0, &RxMessage, rx_msg);
 	memcpy(can_rx_data, rx_msg, 8);
+
+    /* 模式切换指令: ID 0x100, 数据前7字节为0, 末字节 0x01=矩阵模式 0x02=阿克曼模式 */
+    if ((RxMessage.StdId == CAN_ID_MODE_CMD) && (RxMessage.IDE == CAN_ID_STD)) {
+        for (i = 0; i < 7; i++) {
+            if (rx_msg[i] != 0x00) {
+                all_zero = 0;
+                break;
+            }
+        }
+        if (all_zero) {
+            if (rx_msg[7] == 0x01) {
+                CAN_SetWheelMode(WHEEL_MODE_MATRIX);     /* 矩阵模式 */
+            } else if (rx_msg[7] == 0x02) {
+                CAN_SetWheelMode(WHEEL_MODE_ACKERMANN);  /* 阿克曼模式 */
+            }
+        }
+    }
 
   /* USER CODE END USB_LP_CAN1_RX0_IRQn 1 */
 }

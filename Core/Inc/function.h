@@ -8,5 +8,6 @@
 void send_ret(void);
 void zero_clearing(void);
 void Wheel_Control(float fx, float fy);
+void force_can_test(void);
 
 #endif

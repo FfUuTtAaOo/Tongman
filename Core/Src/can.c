@@ -123,9 +123,39 @@ void HAL_CAN_MspDeInit(CAN_HandleTypeDef* canHandle)
 /* USER CODE BEGIN 1 */
 
 /* ========== 车轮控制指令数据 (8字节) ========== */
-const uint8_t CMD_LEFT_DATA[8]     = {0x00, 0x00, 0xB8, 0x8B, 0x00, 0x00, 0x00, 0x00}; /* 左转30度(转向轴) */
-const uint8_t CMD_RIGHT_DATA[8]    = {0x00, 0x00, 0x48, 0x74, 0x00, 0x00, 0x04, 0x00}; /* 右转30度(转向轴) */
+/* 转向指令倒数第二位(byte6): 0x04=阿克曼模式, 0x00=矩阵模式 */
+const uint8_t CMD_LEFT_ACK[8]      = {0x00, 0x00, 0xB8, 0x8B, 0x00, 0x00, 0x04, 0x00}; /* 阿克曼 左转30度 */
+const uint8_t CMD_RIGHT_ACK[8]     = {0x00, 0x00, 0x48, 0x74, 0x00, 0x00, 0x04, 0x00}; /* 阿克曼 右转30度 */
+const uint8_t CMD_LEFT_MATRIX[8]   = {0x00, 0x00, 0xB8, 0x8B, 0x00, 0x00, 0x00, 0x00}; /* 矩阵 左转30度 */
+const uint8_t CMD_RIGHT_MATRIX[8]  = {0x00, 0x00, 0x48, 0x74, 0x00, 0x00, 0x00, 0x00}; /* 矩阵 右转30度 */
 const uint8_t CMD_STRAIGHT_DATA[8] = {0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00}; /* 直行/驻车(转向轴回正) */
+
+/* 车轮控制模式, 上电默认阿克曼模式 */
+static WheelMode_t wheel_mode = WHEEL_MODE_ACKERMANN;
+
+/**
+  * @brief  设置车轮控制模式
+  */
+void CAN_SetWheelMode(WheelMode_t mode)
+{
+    wheel_mode = mode;
+}
+
+/**
+  * @brief  获取当前车轮控制模式
+  */
+WheelMode_t CAN_GetWheelMode(void)
+{
+    return wheel_mode;
+}
+
+/**
+  * @brief  获取当前模式对应的指令字节 (驱动/转向帧的倒数第二位)
+  */
+uint8_t CAN_GetWheelModeByte(void)
+{
+    return (wheel_mode == WHEEL_MODE_ACKERMANN) ? WHEEL_MODE_BYTE_ACK : WHEEL_MODE_BYTE_MATRIX;
+}
 
 /* 车轮控制 CAN 发送帧头: 每个轮子独立一组 (驱动 + 转向) */
 typedef struct {
@@ -208,8 +238,9 @@ HAL_StatusTypeDef CAN_SendDriveMsg(WheelIndex_t wheel, const uint8_t *data)
   * @brief  速度值(-10~+10km/h)编码为驱动轴8字节CAN帧数据
   * @param  speed_kmh: 速度值, -10=后退10km/h, +10=前进10km/h, 0=驻车
   * @param  data:  输出的8字节数据
-  * @note   编码规则: byte0/byte1 小端存放速度值,
+  * @note   编码规则: byte0/byte1 小端存放速度值(含方向),
   *         0(0x0000) = -10km/h, 65535(0xFFFF) = +10km/h, 32768(0x8000) = 驻车
+  *         byte6: 模式位, 阿克曼=0x04, 矩阵=0x00 (前进/后退相同)
   */
 static void CAN_BuildDriveData(int16_t speed_kmh, uint8_t *data)
 {
@@ -228,7 +259,7 @@ static void CAN_BuildDriveData(int16_t speed_kmh, uint8_t *data)
     data[3] = 0x00;
     data[4] = 0x00;
     data[5] = 0x00;
-    data[6] = (speed < 0) ? 0x04 : 0x00;      /* 后退方向标志 */
+    data[6] = CAN_GetWheelModeByte();         /* 模式位: 阿克曼0x04 / 矩阵0x00 */
     data[7] = 0x00;
 }
 
@@ -261,6 +292,68 @@ HAL_StatusTypeDef CAN_SendSteerMsg(WheelIndex_t wheel, const uint8_t *data)
         return HAL_ERROR;
     }
     return CAN_SendMsg(&WheelTx[wheel].Steer, data);
+}
+
+/**
+  * @brief  测试用: 将力值按指定格式通过CAN发出 (8字节)
+  * @param  stdId: CAN 标准帧 ID
+  * @param  value: 力值(浮点), 正=正向, 负=反向
+  * @note   数据格式(以 value = 0.123456 为例): 00 00 01 02 03 04 05 06
+  *           byte0~1: 整数部分, 16位有符号大端(负值用补码, 如 -1 -> FF FF)
+  *           byte2~7: 小数部分6位, 每位占1个字节能取0~9, 高位在前
+  *         即: 整数用2字节表示, 小数位用6字节表示, 共8字节
+  */
+static void CAN_SendForceData(uint32_t stdId, float value)
+{
+    CAN_TxHeaderTypeDef header;
+    uint8_t data[8];
+    int32_t scaled;      /* value 放大 1e6 后的定点整数 */
+    int32_t rem;         /* 小数部分(可能为负) */
+    int16_t int_part;    /* 整数部分 */
+    uint32_t frac;       /* 小数部分绝对值(0 ~ 999999) */
+    uint32_t div = 100000u;
+    uint8_t i;
+
+    /* 四舍五入保留6位小数, 转为定点整数 */
+    if (value >= 0.0f) {
+        scaled = (int32_t)(value * 1000000.0f + 0.5f);
+    } else {
+        scaled = (int32_t)(value * 1000000.0f - 0.5f);
+    }
+
+    /* C99 除法向零截断, 取模结果符号与被除数一致 */
+    int_part = (int16_t)(scaled / 1000000);
+    rem      = scaled % 1000000;
+    frac     = (rem < 0) ? (uint32_t)(-rem) : (uint32_t)rem;
+
+    /* 整数部分: 16位有符号大端 */
+    data[0] = (uint8_t)(((uint16_t)int_part >> 8) & 0xFF);
+    data[1] = (uint8_t)((uint16_t)int_part & 0xFF);
+
+    /* 小数部分: 6位十进制数字, 每位占1字节, 高位在前 */
+    for (i = 0; i < 6; i++) {
+        data[2 + i] = (uint8_t)((frac / div) % 10u);
+        div /= 10u;
+    }
+
+    CAN_TxHeader_Init(&header, stdId);
+    CAN_SendMsg(&header, data);
+}
+
+/**
+  * @brief  测试用: 将FX轴力值通过CAN发出 (ID 0x100)
+  */
+void CAN_SendFXData(float fx)
+{
+    CAN_SendForceData(CAN_ID_FX_TEST, fx);
+}
+
+/**
+  * @brief  测试用: 将FY轴力值通过CAN发出 (ID 0x101)
+  */
+void CAN_SendFYData(float fy)
+{
+    CAN_SendForceData(CAN_ID_FY_TEST, fy);
 }
 
 void configure_CAN_filter(void)

@@ -62,21 +62,29 @@ static int16_t ForceToSpeed(float fy)
   */
 void Wheel_Control(float fx, float fy)
 {
-    static int16_t last_speed = 99;                /* 上次发送的速度档位(初始非有效值, 保证首次发送) */
-    static const uint8_t *last_steer_cmd = NULL;   /* 上次发送的转向指令 */
+    static int16_t last_speed = 99;                     /* 上次发送的速度档位(初始非有效值, 保证首次发送) */
+    static const uint8_t *last_steer_cmd = NULL;        /* 上次发送的转向指令 */
+    static WheelMode_t last_mode = WHEEL_MODE_ACKERMANN;/* 上次使用的控制模式 */
     const uint8_t *steer_cmd;  /* 转向指令 */
     int16_t speed;             /* 速度档位 */
+    WheelMode_t mode = CAN_GetWheelMode();  /* 当前控制模式 */
 
-    /* ---- Y轴: 力值映射为速度档位(-10~+10) ---- */
+    /* ---- 模式发生变化: 强制重新下发转向指令 ---- */
+    if (mode != last_mode) {
+        last_steer_cmd = NULL;
+        last_mode = mode;
+    }
+
+    /* ---- Y轴: 力值映射为速度档位(-10~+10), 驱动指令与模式无关 ---- */
     speed = ForceToSpeed(fy);
 
-    /* ---- X轴: 左转/右转判断 ---- */
+    /* ---- X轴: 左转/右转判断 (转向指令按模式选择) ---- */
     if (fx > DEAD_ZONE) {
-        steer_cmd = CMD_RIGHT_DATA;         /* 右转 */
+        steer_cmd = (mode == WHEEL_MODE_ACKERMANN) ? CMD_RIGHT_ACK : CMD_RIGHT_MATRIX;  /* 右转 */
     } else if (fx < -DEAD_ZONE) {
-        steer_cmd = CMD_LEFT_DATA;          /* 左转 */
+        steer_cmd = (mode == WHEEL_MODE_ACKERMANN) ? CMD_LEFT_ACK : CMD_LEFT_MATRIX;    /* 左转 */
     } else {
-        steer_cmd = CMD_STRAIGHT_DATA;      /* 直行(转向回正) */
+        steer_cmd = CMD_STRAIGHT_DATA;      /* 直行(转向回正), 两种模式一致 */
     }
 
     /* ---- 驱动/转向指令均与上次相同, 无需重新发送 ---- */
@@ -122,6 +130,28 @@ void send_ret(void)
     /* a[2] = Z轴 → 暂不使用    */
     Wheel_Control(a[0], a[1]);
 //    Wheel_Control(can_rx_data[6], can_rx_data[7]);
+}
+
+/**
+  * @brief  测试用: 采集3维力传感器数据, 将FX/FY轴力值分别通过CAN发出
+  * @note   仅用于验证FX/FY采集是否正常, 不做车轮控制
+  *         a[0] = X轴(FX) -> CAN ID 0x100
+  *         a[1] = Y轴(FY) -> CAN ID 0x101
+  *         a[2] = Z轴(暂不使用)
+  */
+void force_can_test(void)
+{
+    float a[ADC_CHANNEL_NUM] = { 0 };
+    float a_tmp;
+
+    for (uint8_t i = 0; i < ADC_CHANNEL_NUM; ++i) {
+        a_tmp = adcData() - zero[i];
+        a[i] = a_tmp * VOLTAGE;
+    }
+
+    /* 将FX轴(a[0])、FY轴(a[1])力值通过CAN发出, 便于上位机/分析仪查看 */
+    CAN_SendFXData(a[0]);   /* ID 0x100 */
+    CAN_SendFYData(a[1]);   /* ID 0x101 */
 }
 
 void zero_clearing(void)
